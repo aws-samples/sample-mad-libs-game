@@ -1,0 +1,307 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+  - name: madlibs
+    description: Madlibs workshop client operations
+paths:
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+  /config:
+    get:
+      operationId: getConfig
+      tags: [madlibs]
+      summary: Read the configured game server URL
+      responses:
+        "200":
+          description: Current client configuration
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ClientConfig"
+  /join:
+    post:
+      operationId: joinGame
+      tags: [madlibs]
+      summary: Validate a game server and start a player session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JoinInput"
+      responses:
+        "200":
+          description: Joined game successfully
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JoinResponse"
+        "400":
+          description: Invalid join details or unreachable game server
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Game server rejected the join code
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /poll:
+    post:
+      operationId: pollGame
+      tags: [madlibs]
+      summary: Poll the current game state
+      responses:
+        "200":
+          description: Current game state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PollResponse"
+        "401":
+          description: No active player session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Game server error
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /submit:
+    post:
+      operationId: submitWord
+      tags: [madlibs]
+      summary: Submit the player's assigned word
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SubmitInput"
+      responses:
+        "200":
+          description: Word accepted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SubmitResponse"
+        "400":
+          description: Invalid word or no active session
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: Submission rejected
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /my-words:
+    get:
+      operationId: getMyWords
+      tags: [madlibs]
+      summary: Read this player's recent submitted words
+      responses:
+        "200":
+          description: Recent words
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MyWordsResponse"
+components:
+  schemas:
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+    ClientConfig:
+      type: object
+      properties:
+        gameServerUrl:
+          type: string
+        fromEnv:
+          type: boolean
+      required: [gameServerUrl, fromEnv]
+    JoinInput:
+      type: object
+      properties:
+        token:
+          type: string
+          minLength: 1
+          maxLength: 64
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 24
+        playerKey:
+          type: string
+          minLength: 8
+          maxLength: 128
+        gameServerUrl:
+          type: string
+          minLength: 1
+          maxLength: 2048
+      required: [token, displayName, playerKey, gameServerUrl]
+    JoinResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        player:
+          $ref: "#/components/schemas/Player"
+      required: [ok]
+    PollResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        now:
+          type: number
+        player:
+          $ref: "#/components/schemas/Player"
+        round:
+          anyOf:
+            - $ref: "#/components/schemas/Round"
+            - type: "null"
+        you:
+          $ref: "#/components/schemas/YourBlank"
+        stats:
+          $ref: "#/components/schemas/Stats"
+        error:
+          type: string
+      required: [ok]
+    SubmitInput:
+      type: object
+      properties:
+        word:
+          type: string
+          minLength: 1
+          maxLength: 40
+        hint:
+          type: string
+          maxLength: 80
+          description: The blank's prompt, kept alongside the word in the player's history.
+      required: [word]
+    SubmitResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        word:
+          type: string
+        blankIndex:
+          type: integer
+        error:
+          type: string
+      required: [ok]
+    MyWordsResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        words:
+          type: array
+          items:
+            $ref: "#/components/schemas/MyWord"
+      required: [ok, words]
+    MyWord:
+      type: object
+      properties:
+        word:
+          type: string
+        hint:
+          type: string
+        at:
+          type: integer
+          format: int64
+          description: Epoch milliseconds when the word was submitted.
+      required: [word, at]
+    ErrorResponse:
+      type: object
+      properties:
+        ok:
+          type: boolean
+        error:
+          type: string
+      required: [ok, error]
+    Player:
+      type: object
+      properties:
+        playerId: { type: string }
+        displayName: { type: string }
+        mode: { type: string }
+        deployed: { type: boolean }
+      required: [playerId, displayName, mode, deployed]
+    RoundPart:
+      type: object
+      properties:
+        kind: { type: string }
+        text: { type: ["string", "null"] }
+        index: { type: ["integer", "null"] }
+        hint: { type: ["string", "null"] }
+        example: { type: ["string", "null"] }
+        word: { type: ["string", "null"] }
+        by: { type: ["string", "null"] }
+        filler: { type: ["boolean", "null"] }
+      required: [kind]
+    Round:
+      type: object
+      properties:
+        roundId: { type: string }
+        seq: { type: integer }
+        phase: { type: string }
+        title: { type: string }
+        endsAt: { type: ["number", "null"] }
+        blankCount: { type: integer }
+        parts:
+          type: array
+          items:
+            $ref: "#/components/schemas/RoundPart"
+      required: [roundId, seq, phase, title, endsAt, blankCount, parts]
+    YourBlank:
+      type: object
+      properties:
+        blankIndex: { type: ["integer", "null"] }
+        hint: { type: ["string", "null"] }
+        example: { type: ["string", "null"] }
+        word: { type: ["string", "null"] }
+        submitted: { type: boolean }
+      required: [blankIndex, hint, example, word, submitted]
+    Stats:
+      type: object
+      properties:
+        players: { type: integer }
+        active: { type: integer }
+        deployed: { type: integer }
+        local: { type: integer }
+      required: [players, active, deployed, local]
+

@@ -1,0 +1,28 @@
+kind = "web"
+previewPath = "/"
+title = "Madlibs Workshop Client"
+description = "A phone-friendly Madlibs party-game client that lets workshop players join an existing game server, submit their assigned word, follow the round countdown, and read the finished story."
+version = "1.0.0"
+id = "artifacts/madlibs-client"
+router = "path"
+
+[[services]]
+name = "web"
+paths = [ "/" ]
+localPort = 25232
+
+[services.development]
+run = "pnpm --filter @workspace/madlibs-client run dev"
+
+[services.production]
+build = [ "pnpm", "--filter", "@workspace/madlibs-client", "run", "build" ]
+serve = "static"
+publicDir = "artifacts/madlibs-client/dist/public"
+
+[[services.production.rewrites]]
+from = "/*"
+to = "/index.html"
+
+[services.env]
+PORT = "25232"
+BASE_PATH = "/"
