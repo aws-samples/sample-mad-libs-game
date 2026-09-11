@@ -54,7 +54,7 @@ host or restarts.
 
 ## Prerequisites
 
-- **Node.js 24** or later
+- **Node.js 22** or later
 - **pnpm 10** — this workspace is pnpm-only and will refuse `npm install`
 - **The URL of a running game server.** This client neither includes nor mocks one.
 

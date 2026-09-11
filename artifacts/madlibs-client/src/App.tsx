@@ -363,13 +363,13 @@ function GameScreen({
   const [clock, setClock] = useState(Date.now());
   const [lastPollFailure, setLastPollFailure] = useState<{ message: string; status?: number } | null>(null);
   const credentialsRef = useRef(getCredentials());
-  const pollRef = useRef(pollGame.mutate);
+  const pollRef = useRef(pollGame.mutateAsync);
   const submitRef = useRef(submitWord.mutate);
   const onSessionEndedRef = useRef(onSessionEnded);
   const [poll, setPoll] = useState<PollResponse | undefined>();
   const previousRoundId = useRef<string | null>(null);
 
-  pollRef.current = pollGame.mutate;
+  pollRef.current = pollGame.mutateAsync;
   submitRef.current = submitWord.mutate;
   onSessionEndedRef.current = onSessionEnded;
 
@@ -386,28 +386,30 @@ function GameScreen({
     }
 
     // Schedule the next poll only once the previous one settles, so a slow
-    // request cannot stack another on top of it.
+    // request cannot stack another on top of it. Drive the loop off the awaited
+    // promise, not react-query's per-call callbacks: a mutation hook keeps one
+    // options slot, so any other poll call would replace this one's onSettled
+    // and the loop would never reschedule.
     let timer = 0;
     let stopped = false;
 
-    const request = () => pollRef.current({ data: credentials }, {
-      onSuccess: (result) => {
+    const request = async () => {
+      try {
+        const result = await pollRef.current({ data: credentials });
         setPoll(result);
         if (!result.ok) {
           setLastPollFailure({ message: result.error || 'The game server returned an invalid state.' });
         } else {
           setLastPollFailure(null);
         }
-      },
-      onError: (error) => {
+      } catch (error) {
         setLastPollFailure({ message: apiError(error, 'The game server is unreachable.'), status: apiStatus(error) });
-      },
-      onSettled: () => {
+      } finally {
         if (!stopped) timer = window.setTimeout(request, POLL_MS);
-      },
-    });
+      }
+    };
 
-    request();
+    void request();
     return () => {
       stopped = true;
       window.clearTimeout(timer);
@@ -446,7 +448,13 @@ function GameScreen({
               type="button"
               onClick={() => {
                 const credentials = credentialsRef.current;
-                if (credentials) pollRef.current({ data: credentials });
+                if (!credentials) return;
+                void pollRef.current({ data: credentials })
+                  .then((result) => {
+                    setPoll(result);
+                    if (result.ok) setLastPollFailure(null);
+                  })
+                  .catch(() => {});
               }}
               className="focus-ring h-12 rounded-2xl bg-primary px-5 font-extrabold text-primary-foreground"
               data-testid="button-retry-poll"
@@ -478,7 +486,7 @@ function GameScreen({
               at: Date.now(),
             }),
           );
-          pollRef.current({ data: credentials }, { onSuccess: setPoll });
+          void pollRef.current({ data: credentials }).then(setPoll).catch(() => {});
         },
       },
     );
