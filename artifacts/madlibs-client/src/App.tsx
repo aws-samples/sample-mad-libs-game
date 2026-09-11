@@ -1,12 +1,11 @@
 import { type FormEvent, type ReactNode, useEffect, useRef, useState } from 'react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import {
-  getGetMyWordsQueryKey,
   useGetConfig,
-  useGetMyWords,
   useJoinGame,
   usePollGame,
   useSubmitWord,
+  type PlayerCredentials,
   type PollResponse,
   type RoundPart,
   type Stats,
@@ -20,6 +19,44 @@ const POLL_MS = 1000;
 const NAME_STORAGE_KEY = 'madlibs-display-name';
 const TOKEN_STORAGE_KEY = 'madlibs-join-code';
 const SERVER_STORAGE_KEY = 'madlibs-server-url';
+const KEY_STORAGE_KEY = 'madlibs-player-key';
+const HISTORY_STORAGE_KEY = 'madlibs-history';
+
+type PlayedWord = { word: string; hint?: string; at: number };
+
+// The server keeps no session, so the browser owns the credentials and sends
+// them with every call.
+function getCredentials(): PlayerCredentials | null {
+  const token = window.localStorage.getItem(TOKEN_STORAGE_KEY);
+  const displayName = window.localStorage.getItem(NAME_STORAGE_KEY);
+  const gameServerUrl = window.localStorage.getItem(SERVER_STORAGE_KEY);
+  const playerKey = window.localStorage.getItem(KEY_STORAGE_KEY);
+  if (!token || !displayName || !gameServerUrl || !playerKey) return null;
+  return { token, displayName, gameServerUrl, playerKey };
+}
+
+function setCredentials(credentials: PlayerCredentials) {
+  window.localStorage.setItem(TOKEN_STORAGE_KEY, credentials.token);
+  window.localStorage.setItem(NAME_STORAGE_KEY, credentials.displayName);
+  window.localStorage.setItem(SERVER_STORAGE_KEY, credentials.gameServerUrl);
+  window.localStorage.setItem(KEY_STORAGE_KEY, credentials.playerKey);
+}
+
+function readHistory(): PlayedWord[] {
+  try {
+    const raw = window.localStorage.getItem(HISTORY_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? (parsed as PlayedWord[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+function appendHistory(entry: PlayedWord): PlayedWord[] {
+  const words = [...readHistory(), entry].slice(-50);
+  window.localStorage.setItem(HISTORY_STORAGE_KEY, JSON.stringify(words));
+  return words;
+}
 
 function apiError(error: unknown, fallback: string) {
   if (typeof error === 'string') return error;
@@ -41,10 +78,10 @@ function apiStatus(error: unknown) {
 }
 
 function makePlayerKey() {
-  const stored = window.localStorage.getItem('madlibs-player-key');
+  const stored = window.localStorage.getItem(KEY_STORAGE_KEY);
   if (stored) return stored;
   const next = window.crypto?.randomUUID?.() || `player-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  window.localStorage.setItem('madlibs-player-key', next);
+  window.localStorage.setItem(KEY_STORAGE_KEY, next);
   return next;
 }
 
@@ -128,24 +165,21 @@ function JoinScreen({ onJoined }: { onJoined: (result: { name: string }) => void
       return;
     }
     setFormError('');
+    const credentials: PlayerCredentials = {
+      token: token.trim(),
+      displayName: displayName.trim(),
+      gameServerUrl: gameServerUrl.trim(),
+      playerKey: makePlayerKey(),
+    };
     joinGame.mutate(
-      {
-        data: {
-          token: token.trim(),
-          displayName: displayName.trim(),
-          gameServerUrl: gameServerUrl.trim(),
-          playerKey: makePlayerKey(),
-        },
-      },
+      { data: credentials },
       {
         onSuccess: (result) => {
           if (!result.ok || !result.player) {
             setFormError('The game server did not accept the join request. Check the join code and try again.');
             return;
           }
-          window.localStorage.setItem(NAME_STORAGE_KEY, displayName.trim());
-          window.localStorage.setItem(TOKEN_STORAGE_KEY, token.trim());
-          window.localStorage.setItem(SERVER_STORAGE_KEY, gameServerUrl.trim());
+          setCredentials(credentials);
           onJoined({ name: result.player.displayName });
         },
         onError: (error) => setFormError(apiError(error, 'The game server could not be reached. Check the address and try again.')),
@@ -324,12 +358,11 @@ function GameScreen({
 }) {
   const pollGame = usePollGame();
   const submitWord = useSubmitWord();
-  const myWords = useGetMyWords({
-    query: { enabled: true, queryKey: getGetMyWordsQueryKey(), refetchInterval: 5000 },
-  });
+  const [recentWords, setRecentWords] = useState<PlayedWord[]>(() => readHistory());
   const [word, setWord] = useState('');
   const [clock, setClock] = useState(Date.now());
   const [lastPollFailure, setLastPollFailure] = useState<{ message: string; status?: number } | null>(null);
+  const credentialsRef = useRef(getCredentials());
   const pollRef = useRef(pollGame.mutate);
   const submitRef = useRef(submitWord.mutate);
   const onSessionEndedRef = useRef(onSessionEnded);
@@ -346,7 +379,18 @@ function GameScreen({
   }, []);
 
   useEffect(() => {
-    const request = () => pollRef.current(undefined, {
+    const credentials = credentialsRef.current;
+    if (!credentials) {
+      onSessionEndedRef.current();
+      return;
+    }
+
+    // Schedule the next poll only once the previous one settles, so a slow
+    // request cannot stack another on top of it.
+    let timer = 0;
+    let stopped = false;
+
+    const request = () => pollRef.current({ data: credentials }, {
       onSuccess: (result) => {
         setPoll(result);
         if (!result.ok) {
@@ -356,23 +400,24 @@ function GameScreen({
         }
       },
       onError: (error) => {
-        if (apiStatus(error) === 401) {
-          onSessionEndedRef.current();
-          return;
-        }
         setLastPollFailure({ message: apiError(error, 'The game server is unreachable.'), status: apiStatus(error) });
       },
+      onSettled: () => {
+        if (!stopped) timer = window.setTimeout(request, POLL_MS);
+      },
     });
+
     request();
-    const interval = window.setInterval(request, POLL_MS);
-    return () => window.clearInterval(interval);
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
   }, []);
 
   const you = poll?.you;
   const round = poll?.round;
   const submitted = Boolean(you?.submitted);
   const canSubmit = Boolean(word.trim()) && !submitted && !submitWord.isPending;
-  const recentWords = myWords.data?.words || [];
   const phase = round?.phase?.toLowerCase() || 'waiting';
 
   useEffect(() => {
@@ -397,7 +442,17 @@ function GameScreen({
           </p>
           {mayBeToken ? <p className="mt-5 text-sm leading-6 text-muted-foreground">The join code may have changed — re-enter it to join again.</p> : null}
           <div className="mt-7 flex flex-col gap-3 sm:flex-row">
-            <button type="button" onClick={() => pollRef.current(undefined)} className="focus-ring h-12 rounded-2xl bg-primary px-5 font-extrabold text-primary-foreground" data-testid="button-retry-poll">Retry now</button>
+            <button
+              type="button"
+              onClick={() => {
+                const credentials = credentialsRef.current;
+                if (credentials) pollRef.current({ data: credentials });
+              }}
+              className="focus-ring h-12 rounded-2xl bg-primary px-5 font-extrabold text-primary-foreground"
+              data-testid="button-retry-poll"
+            >
+              Retry now
+            </button>
             {mayBeToken ? <button type="button" onClick={onEdit} className="focus-ring h-12 rounded-2xl border border-border bg-background px-5 font-extrabold" data-testid="button-edit-join">Re-enter join code</button> : null}
           </div>
         </section>
@@ -407,18 +462,23 @@ function GameScreen({
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!canSubmit) return;
+    const credentials = credentialsRef.current;
+    if (!canSubmit || !credentials) return;
+    const played = word.trim();
     submitRef.current(
-      { data: { word: word.trim(), ...(you?.hint ? { hint: you.hint } : {}) } },
+      { data: { ...credentials, word: played } },
       {
         onSuccess: (result) => {
           if (!result.ok) return;
           setWord('');
-          myWords.refetch();
-          pollRef.current(undefined, { onSuccess: setPoll });
-        },
-        onError: (error) => {
-          if (apiStatus(error) === 401) onSessionEndedRef.current();
+          setRecentWords(
+            appendHistory({
+              word: result.word ?? played,
+              ...(you?.hint ? { hint: you.hint } : {}),
+              at: Date.now(),
+            }),
+          );
+          pollRef.current({ data: credentials }, { onSuccess: setPoll });
         },
       },
     );
@@ -516,14 +576,7 @@ function GameScreen({
               <h2 className="text-sm font-extrabold">Your recent words</h2>
               <span className="mono-face text-xs text-muted-foreground">{recentWords.length}</span>
             </div>
-            {myWords.isLoading ? (
-              <div data-testid="loading-recent-words" className="mt-4 space-y-2">
-                <div className="h-9 rounded-xl bg-muted" />
-                <div className="h-9 rounded-xl bg-muted" />
-              </div>
-            ) : myWords.isError ? (
-              <p role="alert" data-testid="status-words-error" className="mt-4 text-sm leading-6 text-destructive">Recent words are unavailable right now.</p>
-            ) : recentWords.length ? (
+            {recentWords.length ? (
               <ul className="mt-3 divide-y divide-border">
                 {recentWords.slice(-6).reverse().map((recent, index) => (
                   <li key={`${recent.word}-${recent.at}-${index}`} data-testid={`text-recent-word-${index}`} className="py-2.5">

@@ -42,13 +42,16 @@ paths:
     post:
       operationId: joinGame
       tags: [madlibs]
-      summary: Validate a game server and start a player session
+      summary: Check the game server accepts these credentials
+      description: >
+        A handshake, not a login. The server stores nothing: the browser keeps
+        the credentials and sends them again with every later call.
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: "#/components/schemas/JoinInput"
+              $ref: "#/components/schemas/PlayerCredentials"
       responses:
         "200":
           description: Joined game successfully
@@ -73,6 +76,12 @@ paths:
       operationId: pollGame
       tags: [madlibs]
       summary: Poll the current game state
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlayerCredentials"
       responses:
         "200":
           description: Current game state
@@ -80,8 +89,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/PollResponse"
-        "401":
-          description: No active player session
+        "400":
+          description: Invalid or missing player credentials
           content:
             application/json:
               schema:
@@ -111,7 +120,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/SubmitResponse"
         "400":
-          description: Invalid word or no active session
+          description: Invalid word or player credentials
           content:
             application/json:
               schema:
@@ -122,18 +131,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
-  /my-words:
-    get:
-      operationId: getMyWords
-      tags: [madlibs]
-      summary: Read this player's recent submitted words
-      responses:
-        "200":
-          description: Recent words
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/MyWordsResponse"
 components:
   schemas:
     HealthStatus:
@@ -151,7 +148,11 @@ components:
         fromEnv:
           type: boolean
       required: [gameServerUrl, fromEnv]
-    JoinInput:
+    PlayerCredentials:
+      description: >
+        Everything the server needs to act for this player. The browser owns
+        them and sends them with every call, so no request depends on state
+        left behind by an earlier one.
       type: object
       properties:
         token:
@@ -202,15 +203,27 @@ components:
     SubmitInput:
       type: object
       properties:
+        token:
+          type: string
+          minLength: 1
+          maxLength: 64
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 24
+        playerKey:
+          type: string
+          minLength: 8
+          maxLength: 128
+        gameServerUrl:
+          type: string
+          minLength: 1
+          maxLength: 2048
         word:
           type: string
           minLength: 1
           maxLength: 40
-        hint:
-          type: string
-          maxLength: 80
-          description: The blank's prompt, kept alongside the word in the player's history.
-      required: [word]
+      required: [token, displayName, playerKey, gameServerUrl, word]
     SubmitResponse:
       type: object
       properties:
@@ -223,28 +236,6 @@ components:
         error:
           type: string
       required: [ok]
-    MyWordsResponse:
-      type: object
-      properties:
-        ok:
-          type: boolean
-        words:
-          type: array
-          items:
-            $ref: "#/components/schemas/MyWord"
-      required: [ok, words]
-    MyWord:
-      type: object
-      properties:
-        word:
-          type: string
-        hint:
-          type: string
-        at:
-          type: integer
-          format: int64
-          description: Epoch milliseconds when the word was submitted.
-      required: [word, at]
     ErrorResponse:
       type: object
       properties:

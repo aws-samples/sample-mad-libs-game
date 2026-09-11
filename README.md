@@ -33,8 +33,8 @@ A round has two phases: `collecting`, while words are being submitted, and `resu
 when the completed story is revealed everywhere at once.
 
 1. **Join.** The player enters a join code, a display name, and the game server
-   address. The API server validates the address, registers the player upstream, and
-   issues an `httpOnly` session cookie.
+   address. The API server checks the address is a reachable game server and that it
+   accepts the join code. It stores nothing.
 2. **Play.** The browser polls once per second for the current round, the player's
    assigned blank, and game statistics.
 3. **Submit.** One word per player per round. The first submission wins a blank, and a
@@ -42,9 +42,15 @@ when the completed story is revealed everywhere at once.
 4. **Reveal.** When the round closes, the story comes back with every blank filled —
    including stand-ins for any blank nobody claimed.
 
-The API server is a real server-side process, not a static host: it holds the join code
-so the browser never sees it, and reports whether this client is running locally or
-deployed.
+The API server is a real server-side process, not a static host: it proxies the game
+server and reports whether this client is running locally or deployed.
+
+**It is stateless, on purpose.** The browser keeps the player's credentials — join
+code, display name, player key, game server address — and sends them with every call,
+so no request depends on state an earlier one left behind. The word history lives in
+`localStorage` for the same reason. Nothing here needs a session store, and adding one
+(a `Map`, an in-process cache) would break the app as soon as it runs on more than one
+host or restarts.
 
 ## Prerequisites
 
@@ -78,7 +84,6 @@ Nothing contacts the game server until **Join** is pressed.
 ## Running the app
 
 Two services behind one origin: the web client on `/` and the API server on `/api`.
-They must share an origin, because the session lives in a cookie.
 
 ```bash
 pnpm install
@@ -93,7 +98,7 @@ artifacts/
   madlibs-client/          React + Vite + Tailwind browser client
     src/App.tsx            join screen, game screen, error screen
   api-server/              Express 5 API server
-    src/routes/madlibs.ts  game-server proxy, sessions, word history
+    src/routes/madlibs.ts  game-server proxy
     src/routes/health.ts   liveness probe
 lib/
   api-spec/openapi.yaml    source of truth for the internal API contract
@@ -120,8 +125,8 @@ Conventions worth knowing before making changes:
 - **Do not construct API payloads by hand.** Import the generated hooks from
   `@workspace/api-client-react` and the schemas from `@workspace/api-zod`.
 - **Regenerate rather than edit** anything under a `generated/` directory.
-- There is no database. All game state belongs to the game server; this app keeps only
-  per-session data in memory, and a restart means joining again.
+- There is no database, and no server-side session. All game state belongs to the game
+  server; anything per-player lives in the browser and travels with each request.
 - `pnpm-workspace.yaml` enforces a minimum npm release age as a supply-chain
   safeguard. Leave it enabled.
 

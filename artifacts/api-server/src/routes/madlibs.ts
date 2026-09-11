@@ -1,10 +1,9 @@
-import { randomUUID } from "node:crypto";
 import { Router, type IRouter, type Request, type Response } from "express";
 import {
   GetConfigResponse,
-  GetMyWordsResponse,
   JoinGameBody,
   JoinGameResponse,
+  PollGameBody,
   PollGameResponse,
   SubmitWordBody,
   SubmitWordResponse,
@@ -12,8 +11,6 @@ import {
 
 const router: IRouter = Router();
 
-const SESSION_COOKIE = "madlibs_session";
-const SESSION_TTL_MS = 1000 * 60 * 60 * 12;
 const UPSTREAM_TIMEOUT_MS = 6000;
 const PLACEHOLDER = "<PASTE_GAME_SERVER_URL_HERE>";
 
@@ -23,13 +20,16 @@ const runningDeployed = !!(
 const deployedRegion =
   process.env.AWS_REGION ?? (process.env.REPLIT_DEPLOYMENT ? "replit" : "");
 
-type Session = {
+/**
+ * Every request carries the player's identity, so this server keeps no state
+ * between requests. Keep it that way: a Map or cache here works on one host and
+ * breaks the moment the app runs on more than one — or restarts.
+ */
+type Credentials = {
   token: string;
   gameServerUrl: string;
   playerKey: string;
   displayName: string;
-  origin: string;
-  createdAt: number;
 };
 
 type UpstreamError = {
@@ -86,11 +86,6 @@ type UpstreamHello = {
   error?: string;
 };
 
-type PlayedWord = { word: string; hint?: string; at: number };
-
-const sessions = new Map<string, Session>();
-const wordsByPlayer = new Map<string, PlayedWord[]>();
-
 function configuredGameServerUrl(): string {
   const raw = process.env.GAME_SERVER_URL?.trim() ?? "";
   if (!raw || raw === PLACEHOLDER) return "";
@@ -117,18 +112,6 @@ function requestOrigin(req: Request): string {
   const forwardedHost = req.get("x-forwarded-host") ?? req.get("host");
   const forwardedProto = req.get("x-forwarded-proto") ?? req.protocol;
   return `${forwardedProto}://${forwardedHost}`;
-}
-
-function sessionFor(req: Request): Session | null {
-  const sessionId = req.cookies?.[SESSION_COOKIE];
-  if (!sessionId) return null;
-  const session = sessions.get(sessionId);
-  if (!session) return null;
-  if (Date.now() - session.createdAt > SESSION_TTL_MS) {
-    sessions.delete(sessionId);
-    return null;
-  }
-  return session;
 }
 
 function sendError(res: Response, status: number, error: string) {
@@ -175,14 +158,30 @@ function upstreamErrorText(data: unknown): string | null {
   return typeof error === "string" && error ? error : null;
 }
 
-function helloPayload(session: Session) {
+function helloPayload(credentials: Credentials, origin: string) {
   return {
-    token: session.token,
-    playerKey: session.playerKey,
-    displayName: session.displayName,
-    origin: session.origin,
+    token: credentials.token,
+    playerKey: credentials.playerKey,
+    displayName: credentials.displayName,
+    origin,
     mode: runningDeployed ? "aws" : "local",
     region: deployedRegion,
+  };
+}
+
+function credentialsFrom(data: {
+  token: string;
+  displayName: string;
+  playerKey: string;
+  gameServerUrl: string;
+}): Credentials | null {
+  const gameServerUrl = normalizeGameServerUrl(data.gameServerUrl);
+  if (!gameServerUrl) return null;
+  return {
+    token: data.token,
+    displayName: data.displayName,
+    playerKey: data.playerKey,
+    gameServerUrl,
   };
 }
 
@@ -209,17 +208,17 @@ router.post("/join", async (req, res) => {
     return sendError(res, 400, "Enter a join code, your name, and a game server URL.");
   }
 
-  const normalizedUrl = normalizeGameServerUrl(parsed.data.gameServerUrl);
-  if (!normalizedUrl) {
+  const credentials = credentialsFrom(parsed.data);
+  if (!credentials) {
     return sendError(res, 400, "Enter a valid http or https game server URL.");
   }
 
-  const health = await upstreamFetch(`${normalizedUrl}/game/health`);
+  const health = await upstreamFetch(`${credentials.gameServerUrl}/game/health`);
   if (!health.response) {
     return sendError(
       res,
       502,
-      `Cannot reach the game server at ${normalizedUrl}`,
+      `Cannot reach the game server at ${credentials.gameServerUrl}`,
     );
   }
   if (
@@ -231,38 +230,22 @@ router.post("/join", async (req, res) => {
     return sendError(res, 400, "That doesn't look like a madlibs game server.");
   }
 
-  const session: Session = {
-    token: parsed.data.token,
-    gameServerUrl: normalizedUrl,
-    playerKey: parsed.data.playerKey,
-    displayName: parsed.data.displayName,
-    origin: requestOrigin(req),
-    createdAt: Date.now(),
-  };
-  const hello = await upstreamFetch(`${normalizedUrl}/game/hello`, {
+  const hello = await upstreamFetch(`${credentials.gameServerUrl}/game/hello`, {
     method: "POST",
-    body: JSON.stringify(helloPayload(session)),
+    body: JSON.stringify(helloPayload(credentials, requestOrigin(req))),
   });
   const helloError = upstreamErrorText(hello.data);
   if (!hello.response) {
     return sendError(
       res,
       502,
-      `Cannot reach the game server at ${normalizedUrl}`,
+      `Cannot reach the game server at ${credentials.gameServerUrl}`,
     );
   }
   if (!hello.response.ok || helloError) {
     return sendError(res, upstreamStatus(hello.response), helloError ?? "The game server rejected the join.");
   }
 
-  const sessionId = randomUUID();
-  sessions.set(sessionId, session);
-  res.cookie(SESSION_COOKIE, sessionId, {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: process.env.NODE_ENV === "production",
-    maxAge: SESSION_TTL_MS,
-  });
   return res.json(
     JoinGameResponse.parse({
       ok: true,
@@ -272,19 +255,26 @@ router.post("/join", async (req, res) => {
 });
 
 router.post("/poll", async (req, res) => {
-  const session = sessionFor(req);
-  if (!session) return sendError(res, 401, "Your session has ended. Please join again.");
+  const parsed = PollGameBody.safeParse(req.body);
+  if (!parsed.success) {
+    return sendError(res, 400, "Join the game again to keep playing.");
+  }
 
-  const hello = await upstreamFetch(`${session.gameServerUrl}/game/hello`, {
+  const credentials = credentialsFrom(parsed.data);
+  if (!credentials) {
+    return sendError(res, 400, "Enter a valid http or https game server URL.");
+  }
+
+  const hello = await upstreamFetch(`${credentials.gameServerUrl}/game/hello`, {
     method: "POST",
-    body: JSON.stringify(helloPayload(session)),
+    body: JSON.stringify(helloPayload(credentials, requestOrigin(req))),
   });
   const helloError = upstreamErrorText(hello.data);
   if (!hello.response) {
     return sendError(
       res,
       502,
-      `Cannot reach the game server at ${session.gameServerUrl}`,
+      `Cannot reach the game server at ${credentials.gameServerUrl}`,
     );
   }
   if (!hello.response.ok || helloError) {
@@ -294,17 +284,21 @@ router.post("/poll", async (req, res) => {
 });
 
 router.post("/submit", async (req, res) => {
-  const session = sessionFor(req);
-  if (!session) return sendError(res, 401, "Your session has ended. Please join again.");
-
   const parsed = SubmitWordBody.safeParse(req.body);
-  if (!parsed.success) return sendError(res, 400, "Enter one word up to 40 characters.");
+  if (!parsed.success) {
+    return sendError(res, 400, "Enter one word up to 40 characters.");
+  }
 
-  const submission = await upstreamFetch(`${session.gameServerUrl}/game/submit`, {
+  const credentials = credentialsFrom(parsed.data);
+  if (!credentials) {
+    return sendError(res, 400, "Enter a valid http or https game server URL.");
+  }
+
+  const submission = await upstreamFetch(`${credentials.gameServerUrl}/game/submit`, {
     method: "POST",
     body: JSON.stringify({
-      token: session.token,
-      playerKey: session.playerKey,
+      token: credentials.token,
+      playerKey: credentials.playerKey,
       word: parsed.data.word,
     }),
   });
@@ -313,7 +307,7 @@ router.post("/submit", async (req, res) => {
     return sendError(
       res,
       502,
-      `Cannot reach the game server at ${session.gameServerUrl}`,
+      `Cannot reach the game server at ${credentials.gameServerUrl}`,
     );
   }
   if (!submission.response.ok || submissionError) {
@@ -324,26 +318,7 @@ router.post("/submit", async (req, res) => {
     );
   }
 
-  const data = submission.data as { ok: boolean; word?: string; blankIndex?: number };
-  const words = wordsByPlayer.get(session.playerKey) ?? [];
-  words.push({
-    word: data.word ?? parsed.data.word,
-    ...(parsed.data.hint ? { hint: parsed.data.hint } : {}),
-    at: Date.now(),
-  });
-  wordsByPlayer.set(session.playerKey, words.slice(-50));
-  return res.json(SubmitWordResponse.parse(data));
-});
-
-router.get("/my-words", (req, res) => {
-  const session = sessionFor(req);
-  if (!session) return sendError(res, 401, "Your session has ended. Please join again.");
-  return res.json(
-    GetMyWordsResponse.parse({
-      ok: true,
-      words: wordsByPlayer.get(session.playerKey) ?? [],
-    }),
-  );
+  return res.json(SubmitWordResponse.parse(submission.data));
 });
 
 export default router;
